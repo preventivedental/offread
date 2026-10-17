@@ -27,6 +27,9 @@ offread - fetch web pages with wget, scrub them, and read them offline.
 Pages live in ~/OfflineReader (override with OFFREAD_DIR): current copies in
 pages/, replaced bookmark copies in archive/.
 
+If a site blocks non-browser fetches, set OFFREAD_WGET_COOKIES to a Netscape
+cookie file exported from your browser so wget can reuse your session.
+
 What it does:
   Fetch: wget pulls the page plus its images/CSS/fonts. JavaScript files are
   refused by extension (.js/.mjs/...), cookies are off, and common ad/tracker
@@ -659,13 +662,18 @@ def write_index(st):
 
 # ---------------------------------------------------------------- fetch
 
-WGET_COMMON = ["--no-cookies", "-e", "robots=off", "--timeout=20", "--tries=2",
-               "--user-agent", UA]
+def wget_common():
+    opts = ["--no-cookies", "-e", "robots=off", "--timeout=20", "--tries=2",
+            "--user-agent", UA]
+    cookie_file = os.environ.get("OFFREAD_WGET_COOKIES", "").strip()
+    if cookie_file:
+        opts += ["--load-cookies", cookie_file, "--keep-session-cookies"]
+    return opts
 
 
 def find_pixels(url, env):
     """Fetch only the page's HTML (nothing else) and list its tracking pixels."""
-    r = subprocess.run(["wget", "-q", "-O", "-", *WGET_COMMON, url],
+    r = subprocess.run(["wget", "-q", "-O", "-", *wget_common(), url],
                        env=env, capture_output=True)
     if r.returncode != 0 or not r.stdout:
         return set()
@@ -707,7 +715,7 @@ def snapshot(url, first_party=False, allow=(), live=False):
     cmd = [
         "wget",
         "--page-requisites", "--convert-links", "--adjust-extension",
-        "--span-hosts", "--no-verbose", *WGET_COMMON,
+        "--span-hosts", "--no-verbose", *wget_common(),
         "--reject", "*.json,*.wasm,*.swf" + ("" if live else ",*.js,*.mjs"),
         "--reject-regex", "(" + reject + ")",
         "--restrict-file-names=windows",
@@ -723,6 +731,13 @@ def snapshot(url, first_party=False, allow=(), live=False):
     m = re.search(r'-> "(.+?)"', log)
     if not m:
         shutil.rmtree(dest, ignore_errors=True)
+        if "403 Forbidden" in log and "Cf-Mitigated: challenge" in log:
+            print("  blocked by Cloudflare bot challenge (HTTP 403).", file=sys.stderr)
+            print("  try exporting browser cookies and setting OFFREAD_WGET_COOKIES.",
+                  file=sys.stderr)
+            print("  some sites still require a full browser challenge and cannot be",
+                  file=sys.stderr)
+            print("  fetched by wget alone from this network/session.", file=sys.stderr)
         print(log[-2000:], file=sys.stderr)
         print(f"  failed: could not save {url}", file=sys.stderr)
         return None
