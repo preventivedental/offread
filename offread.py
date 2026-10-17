@@ -6,9 +6,10 @@ offread - fetch web pages with wget, scrub them, and read them offline.
       --open                open the last page when done
       --first-party         only pull images/CSS/fonts from the page's own domain
       --allow DOMAIN        extra domain allowed with --first-party (repeatable)
+      --live                keep the page's own scripts running (no egress)
   python3 offread.py mark URL [URL ...]    bookmark links and save them now
       --name LABEL          give the bookmark a name (one URL at a time)
-      (--first-party / --allow work here too and are remembered)
+      (--first-party / --allow / --live work here too and are remembered)
   python3 offread.py marks                 list bookmarks
   python3 offread.py update [N ...]        re-fetch all bookmarks (or just N);
                                            the previous copy moves to the archive.
@@ -46,6 +47,12 @@ What it does:
   the browser will refuse to make the request. Links to other pages are
   routed through the server: the target is fetched and saved, and the local
   copy opens instead of the live web.
+  Live: with --live, the page's own downloaded scripts and stylesheets are
+  kept so it renders as designed, but there is no egress: remote URLs inside
+  CSS and JS text are pointed at an inert placeholder, the CSP only allows
+  the local server and the injected shim, and the shim no-ops sendBeacon,
+  WebSocket, EventSource and persistent storage. Links clicked from a live
+  page are fetched with --live too.
 
 Requires wget (Mac: brew install wget) and Python 3.8+. Standard library only.
 """
@@ -61,6 +68,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from html.parser import HTMLParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -81,6 +89,35 @@ CSP = ("default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inlin
        "font-src 'self' data:; media-src 'self'; script-src 'none'; connect-src 'none'; "
        "frame-src 'none'; child-src 'none'; worker-src 'none'; object-src 'none'; "
        "manifest-src 'none'; form-action 'none'; base-uri 'none'")
+
+# Same sandbox for --live pages, except local (and the injected inline)
+# scripts may run. Every other egress channel stays shut.
+CSP_LIVE = ("default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+            "font-src 'self' data:; media-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "connect-src 'self'; frame-src 'none'; child-src 'none'; worker-src 'none'; "
+            "object-src 'none'; manifest-src 'none'; form-action 'none'; base-uri 'none'")
+
+# Injected at the top of --live pages: closes the tracking APIs that CSP
+# can't reach (sendBeacon ignores CSP in some engines) and makes storage
+# non-persistent so nothing can be stashed for a later page to exfiltrate.
+SHIM = """<script>(function(){
+if (navigator.sendBeacon) navigator.sendBeacon = function(){ return false; };
+window.WebSocket = function(){ throw new Error("offread: no egress"); };
+window.EventSource = function(){ throw new Error("offread: no egress"); };
+try {
+  var mk = function(){ var d = {};
+    return {getItem:function(k){return k in d ? d[k] : null;},
+            setItem:function(k,v){d[k]=String(v);}, removeItem:function(k){delete d[k];},
+            clear:function(){d={};}, key:function(){return null;}, get length(){return 0;}}; };
+  var ls = mk(), ss = mk();  // one store each per page load: works within the
+  Object.defineProperty(window, "localStorage",   {get: function(){ return ls; }});  // page, gone after
+  Object.defineProperty(window, "sessionStorage", {get: function(){ return ss; }});
+} catch (e) {}
+})();</script>"""
+
+# Remote urls inside CSS and JS text are pointed at this inert 1x1 GIF.
+BLANK = ("data:image/gif;base64,"
+         "R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==")
 
 # Hosts wget will refuse to touch while fetching requisites. Add to taste.
 AD_HOSTS = [
@@ -246,10 +283,18 @@ INJECT = (
     '<meta name="referrer" content="no-referrer">'
 )
 
+INJECT_LIVE = (
+    '<meta charset="utf-8">'
+    f'<meta http-equiv="Content-Security-Policy" content="{CSP_LIVE}">'
+    '<meta http-equiv="x-dns-prefetch-control" content="off">'
+    '<meta name="referrer" content="no-referrer">'
+    + SHIM
+)
+
 
 # ---------------------------------------------------------------- scrubber
 
-DROP_WITH_CONTENT = {"script", "iframe", "object", "frame", "frameset",
+DROP_WITH_CONTENT = {"iframe", "object", "frame", "frameset",
                      "applet", "template", "noembed", "portal"}
 DROP_VOID = {"embed", "base", "param"}
 LOAD_ATTRS = {"src", "srcset", "poster", "data", "background", "lowsrc",
@@ -259,22 +304,59 @@ BAD_RELS = {"preconnect", "dns-prefetch", "prefetch", "preload", "prerender",
 STRIP_ATTRS = {"ping", "formaction", "action", "integrity", "nonce",
                "crossorigin", "attributionsrc"}
 
+# url(...) and @import targets inside CSS text.
+CSS_URL_RE = re.compile(
+    r"url\(\s*(['\"]?)(?:https?:)?//[^)'\"]+\1\s*\)", re.I)
+CSS_IMPORT_RE = re.compile(
+    r"@import\s+(['\"])(?:https?:)?//[^'\"]+\1", re.I)
+
+# Absolute or protocol-relative URLs inside JavaScript text.
+JS_URL_RE = re.compile(r"(?:https?:)?//[A-Za-z0-9][^\s'\"<>\\]*")
+
 
 def is_remote(value):
     v = (value or "").strip().lower()
     return "://" in v or v.startswith("//")
 
 
+def scrub_css_text(css):
+    """Point every remote CSS url()/import at the inert placeholder."""
+    css = CSS_URL_RE.sub(f'url("{BLANK}")', css)
+    return CSS_IMPORT_RE.sub(f'@import "{BLANK}"', css)
+
+
+def scrub_js_text(js):
+    """Point absolute URLs in script text at about:blank."""
+    return JS_URL_RE.sub("about:blank", js)
+
+
+def scrub_asset(path):
+    """Defang a saved CSS or JS file in place (live mode only)."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    ext = path.suffix.lower()
+    if ext == ".css":
+        text = scrub_css_text(text)
+    elif ext in (".js", ".mjs"):
+        text = scrub_js_text(text)
+    path.write_text(text, encoding="utf-8")
+
+
 class Scrubber(HTMLParser):
-    def __init__(self, here=None):
+    def __init__(self, here=None, live=False):
         super().__init__(convert_charrefs=False)
         self.here = here  # directory of the HTML file being scrubbed
+        self.live = live  # keep local scripts/styles; defang inline content
         self.out = []
         self.skip = 0
         self.saw_doctype = False
         self.in_title = False
         self.title = ""
         self.in_style = False
+        self.in_script = False
+        self.script_src = None
         self.text = []  # visible text, used to tell if a page changed
 
     def _clean(self, tag, attrs):
@@ -307,11 +389,11 @@ class Scrubber(HTMLParser):
                 continue
             if k in LOAD_ATTRS and is_remote(val):
                 continue
-            if k == "style" and "url(" in low and is_remote(low):
-                continue
+            if k == "style" and ("url(" in low or "@import" in low):
+                val = scrub_css_text(val)  # remote urls become an inert placeholder
             if k == "href" and tag not in ("a", "area") and is_remote(val):
                 continue
-            kept.append((k, v))
+            kept.append((k, v if k != "style" else val))
         return kept
 
     def _local_ok(self, src):
@@ -335,13 +417,20 @@ class Scrubber(HTMLParser):
         self.out.append(f"<!{decl}>")
         if decl.lower().startswith("doctype") and not self.saw_doctype:
             self.saw_doctype = True
-            self.out.append(INJECT)
+            self.out.append(INJECT_LIVE if self.live else INJECT)
 
     def handle_starttag(self, tag, attrs):
         if self.skip:
-            if tag in DROP_WITH_CONTENT:
+            if tag in DROP_WITH_CONTENT or (tag == "script" and not self.live):
                 self.skip += 1
             return
+        if tag == "script":
+            if not self.live:
+                self.skip = 1
+                return
+            d = {k.lower(): (v or "") for k, v in attrs}
+            if is_remote(d.get("src")):
+                return  # remote script: wget never saved it; drop the tag
         if tag in DROP_WITH_CONTENT:
             self.skip = 1
             return
@@ -352,18 +441,27 @@ class Scrubber(HTMLParser):
             self.in_title = True
         elif tag == "style":
             self.in_style = True
+        elif tag == "script":
+            self.in_script = True
+            self.script_src = next((v for k, v in cleaned if k == "src"), None)
         self.out.append(self._render(tag, cleaned))
 
     def handle_startendtag(self, tag, attrs):
         if self.skip or tag in DROP_WITH_CONTENT:
             return
+        if tag == "script":
+            if not self.live:
+                return
+            d = {k.lower(): (v or "") for k, v in attrs}
+            if is_remote(d.get("src")):
+                return
         cleaned = self._clean(tag, attrs)
         if cleaned is not None:
             self.out.append(self._render(tag, cleaned, selfclose=True))
 
     def handle_endtag(self, tag):
         if self.skip:
-            if tag in DROP_WITH_CONTENT:
+            if tag in DROP_WITH_CONTENT or (tag == "script" and not self.live):
                 self.skip -= 1
             return
         if tag in DROP_WITH_CONTENT or tag in DROP_VOID:
@@ -372,15 +470,21 @@ class Scrubber(HTMLParser):
             self.in_title = False
         elif tag == "style":
             self.in_style = False
+        elif tag == "script":
+            self.in_script = False
         self.out.append(f"</{tag}>")
 
     def handle_data(self, data):
         if self.skip:
             return
+        if self.in_style:
+            data = scrub_css_text(data)
+        elif self.live and self.in_script and not self.script_src:
+            data = scrub_js_text(data)
         self.out.append(data)
         if self.in_title:
             self.title += data
-        elif not self.in_style:
+        elif not self.in_style and not self.in_script:
             self.text.append(data)
 
     def handle_entityref(self, name):
@@ -401,19 +505,19 @@ class Scrubber(HTMLParser):
     def unknown_decl(self, data): pass
 
 
-def scrub_file(path):
+def scrub_file(path, live=False):
     """Scrub one saved HTML file in place. Returns (title, text_hash)."""
     raw = path.read_bytes()
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         text = raw.decode("cp1252", errors="replace")
-    s = Scrubber(here=path.parent)
+    s = Scrubber(here=path.parent, live=live)
     s.feed(text)
     s.close()
     out = "".join(s.out)
     if not s.saw_doctype:
-        out = "<!DOCTYPE html>" + INJECT + out
+        out = "<!DOCTYPE html>" + (INJECT_LIVE if live else INJECT) + out
     path.write_text(out, encoding="utf-8")
     words = " ".join("".join(s.text).split())
     return " ".join(s.title.split()), hashlib.sha256(words.encode("utf-8")).hexdigest()
@@ -446,6 +550,7 @@ def load_state():
         p.setdefault("bookmark", None)
         p.setdefault("group", None)
         p.setdefault("hash", "")
+        p.setdefault("live", False)
     return st
 
 
@@ -576,7 +681,7 @@ def find_pixels(url, env):
     return pf.pixels
 
 
-def snapshot(url, first_party=False, allow=()):
+def snapshot(url, first_party=False, allow=(), live=False):
     """Download, de-pixel and scrub one page into pages/<new folder>.
     Returns a page record (not yet added to the manifest) or None."""
     if not shutil.which("wget"):
@@ -602,7 +707,7 @@ def snapshot(url, first_party=False, allow=()):
         "wget",
         "--page-requisites", "--convert-links", "--adjust-extension",
         "--span-hosts", "--no-verbose", *WGET_COMMON,
-        "--reject", "*.js,*.mjs,*.json,*.wasm,*.swf",
+        "--reject", "*.json,*.wasm,*.swf" + ("" if live else ",*.js,*.mjs"),
         "--reject-regex", "(" + reject + ")",
         "--restrict-file-names=windows",
         "-P", str(dest),
@@ -640,9 +745,11 @@ def snapshot(url, first_party=False, allow=()):
     title, digest = "", ""
     for f in dest.rglob("*"):
         if f.suffix.lower() in (".html", ".htm") and f.is_file():
-            t, d = scrub_file(f)
+            t, d = scrub_file(f, live)
             if f.resolve() == main.resolve():
                 title, digest = t, d
+        elif live and f.suffix.lower() in (".css", ".js", ".mjs") and f.is_file():
+            scrub_asset(f)
 
     return {
         "url": url,
@@ -653,6 +760,7 @@ def snapshot(url, first_party=False, allow=()):
         "bookmark": None,
         "group": None,
         "archived": False,
+        "live": live,
     }
 
 
@@ -663,7 +771,8 @@ def discard(page):
 
 def refresh(st, b, force=False):
     """Re-fetch one bookmark. Returns 'new', 'changed', 'same' or 'failed'."""
-    page = snapshot(b["url"], b.get("first_party", False), b.get("allow", []))
+    page = snapshot(b["url"], b.get("first_party", False), b.get("allow", []),
+                    b.get("live", False))
     b["checked"] = now()
     if page is None:
         return "failed"
@@ -686,18 +795,24 @@ def refresh(st, b, force=False):
 
 # ---------------------------------------------------------------- serve
 
+# Recent /go fetch failures: (url, live) -> epoch. Retrying within FAIL_TTL
+# seconds returns the failure page again without another doomed wget run.
+FAILURES = {}
+FAIL_TTL = 60
+
+
 class Handler(SimpleHTTPRequestHandler):
     _fetch_lock = threading.Lock()
 
     # matches <a href="https://..."> in double quotes, single quotes, or bare
     A_RE = re.compile(r'(<a\b[^>]*?\bhref=)(["\'])(https?://[^"\']+)\2', re.I)
     A_RE_BARE = re.compile(r'(<a\b[^>]*?\bhref=)(https?://[^\s>]+)', re.I)
-
     def __init__(self, *a, **k):
         super().__init__(*a, directory=str(CACHE), **k)
 
     def end_headers(self):
-        self.send_header("Content-Security-Policy", CSP)
+        live = getattr(self, "_live", False)
+        self.send_header("Content-Security-Policy", CSP_LIVE if live else CSP)
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-DNS-Prefetch-Control", "off")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -708,12 +823,15 @@ class Handler(SimpleHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/go":
-            return self._go(parsed)
-        if parsed.path.lower().endswith((".html", ".htm")):
-            return self._serve_rewritten()
-        super().do_GET()
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path == "/go":
+                return self._go(parsed)
+            if parsed.path.lower().endswith((".html", ".htm")):
+                return self._serve_rewritten()
+            super().do_GET()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # browser moved on mid-response; nothing to do
 
     def _serve_rewritten(self):
         """Serve a saved page with its live-web links pointed back at /go."""
@@ -721,11 +839,13 @@ class Handler(SimpleHTTPRequestHandler):
         if not path.is_file():
             return super().do_GET()
         text = path.read_text(encoding="utf-8")
+        self._live = '<script src=' in text  # only live pages keep scripts
+        extra = "&live=1" if self._live else ""
         text = self.A_RE.sub(
-            lambda m: f'{m.group(1)}{m.group(2)}/go?url={quote(m.group(3), safe="")}{m.group(2)}',
+            lambda m: f'{m.group(1)}{m.group(2)}/go?url={quote(m.group(3), safe="")}{extra}{m.group(2)}',
             text)
         text = self.A_RE_BARE.sub(
-            lambda m: f'{m.group(1)}"/go?url={quote(m.group(2), safe="")}"',
+            lambda m: f'{m.group(1)}"/go?url={quote(m.group(2), safe="")}{extra}"',
             text)
         self._send(text)
 
@@ -750,14 +870,16 @@ class Handler(SimpleHTTPRequestHandler):
         """Catch a click to the live web: save the page, serve the copy."""
         q = parse_qs(parsed.query)
         url = urldefrag(q.get("url", [""])[0])[0]
+        live = "live" in q
         if urlparse(url).scheme not in ("http", "https"):
             return self._page("<p>Bad link.</p>", status=400)
         st = load_state()
-        have = next((p for p in st["pages"] if not p["archived"] and p["url"] == url), None)
+        have = next((p for p in st["pages"] if not p["archived"] and p["url"] == url
+                     and bool(p.get("live")) == live), None)
         if have:
             return self._redirect(have)
         if "run" not in q:
-            nxt = "/go?" + urlencode({"url": url, "run": "1"})
+            nxt = "/go?" + urlencode({"url": url, "run": "1", **({"live": "1"} if live else {})})
             return self._page(
                 f'<meta http-equiv="refresh" content="0;url={nxt}">'
                 f"<p>Fetching <b>{html.escape(url)}</b> &mdash; "
@@ -765,17 +887,28 @@ class Handler(SimpleHTTPRequestHandler):
         with Handler._fetch_lock:
             st = load_state()  # another click may have saved it meanwhile
             have = next((p for p in st["pages"]
-                         if not p["archived"] and p["url"] == url), None)
+                         if not p["archived"] and p["url"] == url
+                         and bool(p.get("live")) == live), None)
             if not have:
-                have = snapshot(url)
+                fail_at = FAILURES.get((url, live), 0)
+                if time.time() - fail_at < FAIL_TTL:
+                    print(f"  still failing (cached): {url}", file=sys.stderr)
+                    return self._fail_page(url)
+                have = snapshot(url, live=live)
                 if have is None:
-                    return self._page(
-                        "<p>Could not save that page. "
-                        f'<a href="{html.escape(url, quote=True)}">'
-                        "Open the live version</a>.</p>", status=502)
+                    FAILURES[(url, live)] = time.time()
+                    return self._fail_page(url)
                 st["pages"].append(have)
                 save_state(st)
         self._redirect(have)
+
+    def _fail_page(self, url):
+        return self._page(
+            "<p>Could not save that page &mdash; the site refused or timed out. "
+            "Details are in the server terminal. Trying again within a minute "
+            "won't refetch.</p>"
+            f'<p><a href="{html.escape(url, quote=True)}">'
+            "Open the live version</a></p>", status=502)
 
 
 def serve(port, open_path=None):
@@ -812,6 +945,9 @@ def main():
                        help="only fetch images/CSS/fonts from the page's own domain")
         p.add_argument("--allow", action="append", default=[], metavar="DOMAIN",
                        help="extra domain to allow with --first-party (e.g. a CDN)")
+        p.add_argument("--live", action="store_true",
+                       help="keep the page's own scripts/styles running, with all "
+                            "outgoing requests blocked (trackers can't phone home)")
 
     g = sub.add_parser("get", help="save a page once")
     g.add_argument("urls", nargs="+")
@@ -847,7 +983,7 @@ def main():
     if args.cmd == "get":
         last = None
         for u in args.urls:
-            page = snapshot(u, args.first_party, args.allow)
+            page = snapshot(u, args.first_party, args.allow, args.live)
             if page:
                 st["pages"].append(page)
                 save_state(st)
@@ -873,6 +1009,7 @@ def main():
                 b["name"] = args.name
             b["first_party"] = args.first_party
             b["allow"] = args.allow
+            b["live"] = args.live
             if not b["current"]:
                 refresh(st, b)
             save_state(st)

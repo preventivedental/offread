@@ -8,9 +8,10 @@ Fetch web pages with wget, scrub them, and read them offline.
         --open                open the last page when done
         --first-party         only pull images/CSS/fonts from the page's own domain
         --allow DOMAIN        extra domain allowed with --first-party (repeatable)
+        --live                keep the page's own scripts running (no egress)
     python3 offread.py mark URL [URL ...]    bookmark links and save them now
         --name LABEL          give the bookmark a name (one URL at a time)
-        (--first-party / --allow work here too and are remembered)
+        (--first-party / --allow / --live work here too and are remembered)
     python3 offread.py marks                 list bookmarks
     python3 offread.py update [N ...]        re-fetch all bookmarks (or just N);
                                              the previous copy moves to the archive.
@@ -52,6 +53,44 @@ anywhere but that local server. Even if the scrubber missed something, the
 browser will refuse to make the request. Links to other pages are routed
 through the server: the target is fetched and saved, and the local copy opens
 instead of the live web.
+
+**Live mode (`--live`):** the page's own downloaded scripts and stylesheets
+are kept so it renders and behaves as designed — accordions, lightboxes,
+fonts, layout JS all work. But there is no egress: remote URLs inside saved
+CSS/JS are repointed to an inert placeholder, a shim injected into the page
+no-ops `sendBeacon`, `WebSocket`, `EventSource` and persistent storage, and
+the CSP only ever allows the local server. Links clicked from a live page are
+fetched with `--live` too.
+
+## Reading modes: what to expect
+
+**Default (fully stripped).** Use for anything you don't trust, and as the
+everyday default.
+
+- You get the article: text, images, and the page's own downloaded CSS for
+  basic styling. No JavaScript at all.
+- Nothing on the page can contact anything — no trackers, no beacons, no
+  exceptions. This is the airtight mode.
+- Expect some pages to look plainer than the live site, and JS-driven
+  widgets (comment sections, live tickers, expandable galleries) to be inert
+  or missing.
+
+**Live (`--live`).** Use for pages from outlets you broadly trust where the
+stripped version is unreadable — heavy layout JS, paywalled sites that hide
+content behind scripts, image galleries.
+
+- The page renders and behaves much like the real thing.
+- Trackers still can't phone home: every outbound channel is blocked at
+  three layers (wget refused known trackers at fetch time, the scrubber
+  repointed URLs in the saved files, and CSP + the shim block the rest at
+  read time).
+- The caveat: you are now *executing code written by the site* in your
+  browser. It can't send data out, but a hostile (not merely nosey) script
+  can still waste CPU, mine crypto in a loop, or make the tab annoying.
+  If you wouldn't run the site's app, don't read it in live mode.
+
+Both modes store pages the same way and can be mixed: plain and live copies
+of the same URL coexist, and bookmarks remember which mode you chose.
 
 ## Requirements
 
