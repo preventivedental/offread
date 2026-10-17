@@ -78,6 +78,7 @@ from urllib.parse import (parse_qs, quote, unquote, urldefrag, urlencode,
 
 CACHE = Path(os.environ.get("OFFREAD_DIR", str(Path.home() / "OfflineReader")))
 MANIFEST = CACHE / "manifest.json"
+LOG = CACHE / "server.log"
 DEFAULT_PORT = 8787
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 "
@@ -869,7 +870,8 @@ class Handler(SimpleHTTPRequestHandler):
     def _go(self, parsed):
         """Catch a click to the live web: save the page, serve the copy."""
         q = parse_qs(parsed.query)
-        url = urldefrag(q.get("url", [""])[0])[0]
+        # links came from stored HTML, where & was escaped to &amp;
+        url = html.unescape(urldefrag(q.get("url", [""])[0])[0])
         live = "live" in q
         if urlparse(url).scheme not in ("http", "https"):
             return self._page("<p>Bad link.</p>", status=400)
@@ -905,23 +907,42 @@ class Handler(SimpleHTTPRequestHandler):
     def _fail_page(self, url):
         return self._page(
             "<p>Could not save that page &mdash; the site refused or timed out. "
-            "Details are in the server terminal. Trying again within a minute "
-            "won't refetch.</p>"
+            f"Details are in the server terminal and {html.escape(str(LOG))}. "
+            "Trying again within a minute won't refetch.</p>"
             f'<p><a href="{html.escape(url, quote=True)}">'
             "Open the live version</a></p>", status=502)
 
 
+class Tee:
+    """Mirror stdout/stderr to the server log as well as the terminal."""
+
+    def __init__(self, stream, logfile):
+        self.stream = stream
+        self.logfile = logfile
+
+    def write(self, data):
+        self.stream.write(data)
+        self.logfile.write(data)
+        self.logfile.flush()
+
+    def flush(self):
+        self.stream.flush()
+
+
 def serve(port, open_path=None):
     CACHE.mkdir(parents=True, exist_ok=True)
-    write_index(load_state())
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    target = f"http://127.0.0.1:{port}/" + (quote(open_path) if open_path else "index.html")
-    print(f"reading at {target}  (Ctrl-C to stop)")
-    webbrowser.open(target)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    with open(LOG, "a", encoding="utf-8") as lf:
+        sys.stdout = sys.stderr = Tee(sys.stdout, lf)  # log survives the terminal
+        print(f"--- server starting {now()} ---")
+        write_index(load_state())
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        target = f"http://127.0.0.1:{port}/" + (quote(open_path) if open_path else "index.html")
+        print(f"reading at {target}  (Ctrl-C to stop)")
+        webbrowser.open(target)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
 
 
 # ---------------------------------------------------------------- cli

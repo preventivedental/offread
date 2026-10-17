@@ -2,6 +2,13 @@
 
 Fetch web pages with wget, scrub them, and read them offline.
 
+## Quick start
+
+    python3 offread.py get https://example.com --open   # fetch, save, open
+    python3 offread.py mark https://blog.example.com    # keep a page fresh
+    python3 offread.py update                           # re-fetch all bookmarks
+    python3 offread.py read                             # later: open the index
+
 ## Usage
 
     python3 offread.py get URL [URL ...]     fetch and save one or more pages
@@ -22,6 +29,9 @@ Fetch web pages with wget, scrub them, and read them offline.
     python3 offread.py read [N]              open page N (or the index) in your browser
     python3 offread.py read -b N             open bookmark N's latest copy
     python3 offread.py serve                 just run the local reader
+
+Global flag: `--port N` before the command sets the reader's port
+(default 8787).
 
 While reading, clicking a link to the live web fetches and saves that page,
 then opens the local copy.
@@ -91,6 +101,42 @@ content behind scripts, image galleries.
 
 Both modes store pages the same way and can be mixed: plain and live copies
 of the same URL coexist, and bookmarks remember which mode you chose.
+
+## OPSEC: dos and don'ts
+
+Saving a page is a visit: every `get`, `update`, and clicked link is a real
+request from your IP, at that moment, to that site.
+
+**Do**
+
+- Fetch through a VPN or proxy (`https_proxy=... python3 offread.py get ...`)
+  if you don't want the site or your ISP to see the request.
+- Use `--first-party` to keep third-party CDNs and font hosts out of it —
+  wget sends the page's URL as Referer when it downloads assets from them.
+- Prefer default mode for anything you don't trust; save `--live` for sites
+  whose code you'd run anyway.
+- Keep `~/OfflineReader` on an encrypted disk if your reading list is
+  sensitive: pages, URLs, and timestamps are stored as plain files.
+- Point `OFFREAD_DIR` elsewhere (a removable drive, a scratch dir) or delete
+  the folder for a clean slate — `unmark` and `update` deliberately keep old
+  copies.
+
+**Don't**
+
+- Don't assume a fetch looks like your browser: the User-Agent says Safari,
+  but wget's TLS and HTTP fingerprint is not a browser's.
+- Don't expose the reader beyond 127.0.0.1 (no port forwarding, no reverse
+  proxy). It will fetch any URL it's given, and any local process can
+  already browse your index.
+- Don't open saved HTML straight from disk — use `read`/`serve`, so the
+  header-level CSP applies and clicked links route back through the local
+  fetcher instead of out to the live web.
+- Don't count on the blocklists: the ad-host list and pixel heuristics are
+  best-effort. The scrubber and CSP are the backstop, not a guarantee.
+- Don't sync or share the OfflineReader folder (Dropbox, iCloud, git) — it
+  is a timestamped browsing history.
+- Don't schedule frequent `update` runs against sensitive sites: a regular
+  polling pattern is a signal all by itself.
 
 ## Requirements
 
