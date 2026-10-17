@@ -2,6 +2,10 @@
 
 Fetch web pages with wget, scrub them, and read them offline.
 
+## Firefox add-on
+
+There is also a minimal Firefox extension in [`firefox-extension/`](firefox-extension) that snapshots the active tab on demand and renders a sanitized local copy with no network egress.
+
 ## Quick start
 
     python3 offread.py get https://example.com --open   # fetch, save, open
